@@ -49,6 +49,59 @@ class PedestrianCountPredictor:
         self.feature_cols = None
         self.sensor_locations = None
         
+    def _compute_global_spatial_bins(self, df, bins=10):
+        lat = pd.to_numeric(df['latitude'], errors='coerce').astype('float64')
+        lon = pd.to_numeric(df['longitude'], errors='coerce').astype('float64')
+
+        lat_q = max(1, min(bins, lat.nunique()))
+        lon_q = max(1, min(bins, lon.nunique()))
+
+        # Quantile bins; drop duplicates if values repeat
+        df['lat_zone'], lat_bins = pd.qcut(
+            lat, q=lat_q, labels=False, retbins=True, duplicates='drop'
+        )
+        df['lon_zone'], lon_bins = pd.qcut(
+            lon, q=lon_q, labels=False, retbins=True, duplicates='drop'
+        )
+
+        # Fallback if there’s effectively no spread
+        if len(lat_bins) < 2:
+            v = lat.dropna().iloc[0] if lat.notna().any() else 0.0
+            lat_bins = np.array([v - 1e-6, v + 1e-6])
+            df['lat_zone'] = 0
+        if len(lon_bins) < 2:
+            v = lon.dropna().iloc[0] if lon.notna().any() else 0.0
+            lon_bins = np.array([v - 1e-6, v + 1e-6])
+            df['lon_zone'] = 0
+
+        df['lat_zone'] = df['lat_zone'].astype('Int8')
+        df['lon_zone'] = df['lon_zone'].astype('Int8')
+
+        # save for prediction time
+        self.lat_bins = lat_bins
+        self.lon_bins = lon_bins
+        return df
+
+    def _haversine_vec(self, lat1, lon1, lat2, lon2):
+        R = 6371.0  # km
+        lat1 = np.asarray(lat1, dtype='float64')
+        lon1 = np.asarray(lon1, dtype='float64')
+        lat2 = float(lat2)  # ensure scalar float, not 'latitude'
+        lon2 = float(lon2)
+
+        lat1r = np.radians(lat1)
+        lon1r = np.radians(lon1)
+        lat2r = np.radians(lat2)
+        lon2r = np.radians(lon2)
+
+        dlat = lat2r - lat1r
+        dlon = lon2r - lon1r
+        a = np.sin(dlat/2)**2 + np.cos(lat1r) * np.cos(lat2r) * np.sin(dlon/2)**2
+        return (2 * R * np.arcsin(np.sqrt(a))).astype('float32')
+
+
+
+
     def load_and_preprocess_data(self, file_path, chunksize=50000):
         """
         Load and preprocess the data with memory optimization
@@ -92,12 +145,19 @@ class PedestrianCountPredictor:
         
         # Combine all chunks
         df = pd.concat(chunks, ignore_index=True)
+        df = self._compute_global_spatial_bins(df, bins=10)
+
         del chunks
         gc.collect()
         
         print(f"Data loaded: {df.shape[0]:,} rows, {df.shape[1]} columns")
         print(f"Memory usage: {df.memory_usage(deep=True).sum() / 1024**2:.2f} MB")
-        
+        df['lat_zone'] = pd.qcut(df['latitude'].astype('float64'),
+                         q=min(10, df['latitude'].nunique()),
+                         labels=False, duplicates='drop').astype('Int8')
+        df['lon_zone'] = pd.qcut(df['longitude'].astype('float64'),
+                         q=min(10, df['longitude'].nunique()),
+                         labels=False, duplicates='drop').astype('Int8')
         return df
     
     def _process_chunk(self, chunk):
@@ -150,16 +210,19 @@ class PedestrianCountPredictor:
         if not pd.api.types.is_datetime64_any_dtype(t):
             raise ValueError("timestamp_local could not be parsed to datetime; check input format.")
 
-        chunk['year']       = t.dt.year.astype('int16')
-        chunk['month']      = t.dt.month.astype('int8')
-        chunk['day']        = t.dt.day.astype('int8')
-        chunk['hour']       = t.dt.hour.astype('int8')     # overwrite any raw hour to keep consistency
-        chunk['minute']     = t.dt.minute.astype('int8')
-        chunk['dayofyear']  = t.dt.dayofyear.astype('int16')
-        # isocalendar().week is UInt32 → cast to int8 (max 53)
-        chunk['weekofyear'] = t.dt.isocalendar().week.astype('int8')
-        chunk['dow']        = t.dt.dayofweek.astype('int8')
-        chunk['is_weekend'] = (chunk['dow'] >= 5)
+        chunk['year']       = t.dt.year.astype('Int16')
+        chunk['month']      = t.dt.month.astype('Int8')
+        chunk['day']        = t.dt.day.astype('Int8')
+        chunk['hour']       = t.dt.hour.astype('Int8')      # overwrites raw hour for consistency
+        chunk['minute']     = t.dt.minute.astype('Int8')
+        chunk['dayofyear']  = t.dt.dayofyear.astype('Int16')
+        chunk['weekofyear'] = t.dt.isocalendar().week.astype('Int16')  # safe & allows <NA>
+        chunk['dow']        = t.dt.dayofweek.astype('Int8')
+        chunk['is_weekend'] = (chunk['dow'] >= 5).astype('boolean')  # nullable boolean, allows <NA>
+
+        # later:
+        # when you build spatial bins, allow NA too
+        
 
         # 4) Ensure counts/dirs exist
         if 'count' not in chunk.columns:
@@ -212,62 +275,70 @@ class PedestrianCountPredictor:
                      suffixes=('', '_loc_stats'), how='left')
         
         # Create spatial clusters (simple grid-based)
-        df['lat_zone'] = pd.cut(df['latitude'], bins=10, labels=False).astype('int8')
-        df['lon_zone'] = pd.cut(df['longitude'], bins=10, labels=False).astype('int8')
-        df['spatial_cluster'] = df['lat_zone'] * 10 + df['lon_zone']
+
+        df['spatial_cluster'] = (df['lat_zone'].astype('Int16') * 10 + df['lon_zone'].astype('Int16')).astype('Int16')
         
         # Distance to city center (Melbourne CBD approximate center)
         cbd_lat, cbd_lon = -37.8136, 144.9631
-        df['dist_to_cbd'] = df.apply(
-            lambda row: haversine((row['latitude'], row['longitude']), 
-                                (cbd_lat, cbd_lon), unit=Unit.KILOMETERS),
-            axis=1
-        ).astype('float32')
-        
-        # Calculate distances to top 5 busiest locations
-        top_locations = df.groupby('location_id')['count'].mean().nlargest(5).index
+        df[['latitude','longitude']] = df[['latitude','longitude']].apply(pd.to_numeric, errors='coerce')
+
+        # one row per location_id with numeric lat/lon
+        coords = (self.sensor_locations
+                .dropna(subset=['latitude','longitude'])
+                .drop_duplicates('location_id')
+                .set_index('location_id')[['latitude','longitude']]
+                .astype('float64'))
+
+        top_locations = (df.groupby('location_id')['count']
+                        .mean().nlargest(5).index.tolist())
+
         for loc_id in top_locations:
-            loc_data = self.sensor_locations[self.sensor_locations['location_id'] == loc_id].iloc[0]
-            df[f'dist_to_loc_{loc_id}'] = df.apply(
-                lambda row: haversine((row['latitude'], row['longitude']), 
-                                    (loc_data['latitude'], loc_data['longitude']), 
-                                    unit=Unit.KILOMETERS),
-                axis=1
-            ).astype('float32')
+            if loc_id in coords.index:
+                lat2 = float(coords.at[loc_id, 'latitude'])   # <- explicit cell access
+                lon2 = float(coords.at[loc_id, 'longitude'])
+                df[f'dist_to_loc_{loc_id}'] = self._haversine_vec(
+                    df['latitude'].to_numpy(), df['longitude'].to_numpy(), lat2, lon2
+                )
+            else:
+                # location_id without coordinates; skip it
+                continue
         
         return df
     
     def create_temporal_features(self, df):
-        """
-        Create advanced temporal features
-        
-        Parameters:
-        -----------
-        df : pandas DataFrame
-        """
         print("Creating temporal features...")
-        
-        # Cyclical encoding for temporal features
+
+        # --- cyclic encodings (OK if hour/dow have NaN; results become NaN floats) ---
         df['hour_sin'] = np.sin(2 * np.pi * df['hour'] / 24).astype('float32')
         df['hour_cos'] = np.cos(2 * np.pi * df['hour'] / 24).astype('float32')
-        df['dow_sin'] = np.sin(2 * np.pi * df['dow'] / 7).astype('float32')
-        df['dow_cos'] = np.cos(2 * np.pi * df['dow'] / 7).astype('float32')
+        df['dow_sin']  = np.sin(2 * np.pi * df['dow'] / 7).astype('float32')
+        df['dow_cos']  = np.cos(2 * np.pi * df['dow'] / 7).astype('float32')
         df['month_sin'] = np.sin(2 * np.pi * df.get('month', 1) / 12).astype('float32')
         df['month_cos'] = np.cos(2 * np.pi * df.get('month', 1) / 12).astype('float32')
-        
+
         # Time of day categories
-        df['time_category'] = pd.cut(df['hour'], 
-                                     bins=[0, 6, 12, 18, 24],
-                                     labels=['night', 'morning', 'afternoon', 'evening']).astype('category')
-        
-        # Business hours flag
-        df['is_business_hours'] = ((df['hour'] >= 9) & (df['hour'] <= 17) & 
-                                   (~df['is_weekend'])).astype('bool')
-        
-        # Peak hours flag
-        df['is_peak_hour'] = ((df['hour'].isin([7, 8, 9, 17, 18, 19])) & 
-                              (~df['is_weekend'])).astype('bool')
-        
+        df['time_category'] = pd.cut(
+            df['hour'],
+            bins=[0, 6, 12, 18, 24],
+            labels=['night', 'morning', 'afternoon', 'evening'],
+            include_lowest=True
+        ).astype('category')
+
+        # --- IMPORTANT: work with nullable boolean; fill NAs to False for masks ---
+        is_weekend = df['is_weekend'].astype('boolean').fillna(False)
+
+        df['is_business_hours'] = (
+            df['hour'].ge(9) & df['hour'].le(17) & (~is_weekend)
+        ).astype('boolean')
+
+        df['is_peak_hour'] = (
+            df['hour'].isin([7, 8, 9, 17, 18, 19]) & (~is_weekend)
+        ).astype('boolean')
+
+        # Optional: convert boolean features to integers (saves memory, plays nice with sklearn)
+        for col in ['is_weekend', 'is_business_hours', 'is_peak_hour']:
+            df[col] = df[col].fillna(False).astype('uint8')
+
         return df
     
     def create_lag_features(self, df, lag_periods=[1, 24, 168]):
@@ -516,6 +587,12 @@ class PedestrianCountPredictor:
             mape = np.mean(np.abs((y_test[mask] - y_pred[mask]) / y_test[mask])) * 100
             print(f"MAPE: {mape:.2f}%")
     
+    def _zone_from_bins(self, value, bins):
+        if bins is None or len(bins) < 2 or pd.isna(value):
+            return 0
+        idx = int(np.digitize([float(value)], bins, right=False)[0] - 1)
+        return int(np.clip(idx, 0, len(bins) - 2))
+
     def predict_location(self, latitude, longitude, timestamp, 
                         dow=None, is_weekend=None, hour=None):
         """
@@ -556,6 +633,8 @@ class PedestrianCountPredictor:
         nearest_sensor_idx = distances.idxmin()
         nearest_sensor = self.sensor_locations.iloc[nearest_sensor_idx]
         
+        lat_zone = self._zone_from_bins(latitude, getattr(self, 'lat_bins', None))
+        lon_zone = self._zone_from_bins(longitude, getattr(self, 'lon_bins', None))
         # Create feature vector
         features = {
             'latitude': latitude,
@@ -574,8 +653,9 @@ class PedestrianCountPredictor:
             'month_cos': np.cos(2 * np.pi * timestamp.month / 12),
             'is_business_hours': (hour >= 9) and (hour <= 17) and (not is_weekend),
             'is_peak_hour': (hour in [7, 8, 9, 17, 18, 19]) and (not is_weekend),
-            'lat_zone': int(pd.cut([latitude], bins=10, labels=False)[0]),
-            'lon_zone': int(pd.cut([longitude], bins=10, labels=False)[0]),
+            'lat_zone': lat_zone,
+            'lon_zone': lon_zone,
+            'spatial_cluster': lat_zone * 10 + lon_zone,
             'year': timestamp.year,
             'month': timestamp.month,
             'day': timestamp.day,
@@ -658,22 +738,15 @@ if __name__ == "__main__":
     predictor.save_model('pedestrian_count_model.pkl')
     
     # Example prediction for a new location
+    '''
     prediction = predictor.predict_location(
         latitude=-37.814,
         longitude=144.963,
         timestamp='2024-03-15 14:00:00'
     )
+    '''
     
-    print("\n" + "="*50)
-    print("Prediction for New Location:")
-    print("="*50)
-    print(f"Location: ({prediction['latitude']}, {prediction['longitude']})")
-    print(f"Time: {prediction['timestamp']}")
-    print(f"Predicted Count: {prediction['predicted_count']} pedestrians")
-    print(f"Confidence Interval: {prediction['confidence_interval']['lower']}-{prediction['confidence_interval']['upper']}")
-    print(f"Nearest Sensor: {prediction['nearest_sensor']}")
-    print(f"Distance to Nearest Sensor: {prediction['distance_to_nearest_sensor_km']} km")
-    
+
     # Batch prediction example
     print("\n" + "="*50)
     print("Batch Predictions for Multiple Locations:")
