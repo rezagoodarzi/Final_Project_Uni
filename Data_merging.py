@@ -16,7 +16,7 @@ RAW  = DATA
 OUT  = DATA / "processed"
 OUT.mkdir(parents=True, exist_ok=True)
 
-USE_H3 = False           # set False if you don't want H3 r9
+USE_H3 = True           # set False if you don't want H3 r9
 H3_RES = 9
 BOUNDARY_DATE_LOCAL = "2022-12-14 23:59:59"   # Attachment covers up to this (inclusive), local time
 
@@ -217,10 +217,10 @@ df["date"]        = df["timestamp_local"].dt.date
 df = df.dropna(subset=["timestamp_utc", "location_id", "count"]).copy()
 df = df.sort_values(["location_id", "timestamp_utc"]).reset_index(drop=True)
 
-OUT_FILE_PARQUET = OUT / "melbourne_pedestrian_hourly_joined.parquet"
+OUT_FILE_PARQUET = OUT / "melbourne_pedestrian_hourly_joined.csv"
 OUT_FILE_SAMPLE  = OUT / "melbourne_sample_head.csv"
 
-df.to_parquet(OUT_FILE_PARQUET, index=False)
+df.to_csv(OUT_FILE_PARQUET, index=False)
 df.head(50).to_csv(OUT_FILE_SAMPLE, index=False)
 
 print("✅ Done!")
