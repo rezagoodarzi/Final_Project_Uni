@@ -23,6 +23,7 @@ warnings.filterwarnings('ignore')
 try:
     import cupy as cp
     GPU_AVAILABLE = True
+    print("GPU is available")
 except ImportError:
     GPU_AVAILABLE = False
     print("CuPy not installed. Running on CPU.")
@@ -63,6 +64,9 @@ class PedestrianCountPredictor:
         df['lon_zone'], lon_bins = pd.qcut(
             lon, q=lon_q, labels=False, retbins=True, duplicates='drop'
         )
+
+        self.lat_bins = lat_bins.tolist()
+        self.lon_bins = lon_bins.tolist()
 
         # Fallback if there’s effectively no spread
         if len(lat_bins) < 2:
@@ -116,8 +120,8 @@ class PedestrianCountPredictor:
         # Define dtypes for memory optimization
         dtypes = {
             # hourly joined CSV may already be normalized; these are safe
-            'Location_ID': 'Int64',        # allow NA just in case
-            'location_id': 'Int64',
+            'Location_ID': 'string',        # allow NA just in case
+            'location_id': 'string',
             'Sensor_Name': 'category',
             'sensor_name': 'category',
             'Latitude': 'float32',
@@ -279,7 +283,11 @@ class PedestrianCountPredictor:
         df['spatial_cluster'] = (df['lat_zone'].astype('Int16') * 10 + df['lon_zone'].astype('Int16')).astype('Int16')
         
         # Distance to city center (Melbourne CBD approximate center)
-        cbd_lat, cbd_lon = -37.8136, 144.9631
+        cbd_lat, cbd_lon = -37.8136, 144.
+
+        df['dist_to_cbd'] = self._haversine_vec(df['latitude'].to_numpy(),
+                                        df['longitude'].to_numpy(),
+                                        cbd_lat, cbd_lon)
         df[['latitude','longitude']] = df[['latitude','longitude']].apply(pd.to_numeric, errors='coerce')
 
         # one row per location_id with numeric lat/lon
@@ -360,13 +368,10 @@ class PedestrianCountPredictor:
             
         # Rolling statistics
         for window in [24, 168]:  # Daily and weekly windows
-            df[f'count_roll_mean_{window}h'] = df.groupby('location_id')['count'].transform(
-                lambda x: x.rolling(window, min_periods=1).mean()
-            ).astype('float32')
-            
-            df[f'count_roll_std_{window}h'] = df.groupby('location_id')['count'].transform(
-                lambda x: x.rolling(window, min_periods=1).std()
-            ).astype('float32')
+            g = df.groupby('location_id')['count']
+            df[f'count_roll_mean_{window}h'] = g.transform(lambda x: x.rolling(window, min_periods=1).mean().shift(1)).astype('float32')
+            df[f'count_roll_std_{window}h']  = g.transform(lambda x: x.rolling(window, min_periods=2).std().shift(1)).astype('float32')
+
         
         return df
     
@@ -440,11 +445,19 @@ class PedestrianCountPredictor:
         
         # Scale features
         X = self.scaler.fit_transform(X)
-        
+
+        df = df.sort_values('timestamp_local')
+        cut = df['timestamp_local'].max() - pd.Timedelta(days=28)
+        train = df[df['timestamp_local'] <= cut]
+        test  = df[df['timestamp_local']  > cut]
+        X_train, y_train = train[self.feature_cols].values, train['count'].values
+        X_test,  y_test  = test[self.feature_cols].values,  test['count'].values
         # Split data
+        '''
         X_train, X_test, y_train, y_test = train_test_split(
             X, y, test_size=test_size, random_state=42, shuffle=True
         )
+        '''
         
         # Train model based on type
         if self.model_type == 'lightgbm':
@@ -477,13 +490,25 @@ class PedestrianCountPredictor:
             'reg_alpha': 0.1,
             'reg_lambda': 0.1
         }
+
+        tuning_space = {
+            'num_leaves': [31, 63, 127,255,511],
+            'max_depth': [-1, 5, 10, 15],
+            'learning_rate': [0.01, 0.05, 0.1],
+            'feature_fraction': [0.6, 0.8, 1.0],
+            'bagging_fraction': [0.6, 0.8, 1.0],
+            'min_child_samples': [10, 20, 30],
+            'reg_alpha': [0.0, 0.1, 0.2],
+            'reg_lambda': [0.0, 0.1, 0.2],
+            'min_split_gain': [0.0, 0.1, 0.2]
+        }
         
         # Add GPU parameters if available
         if self.use_gpu:
             params['device'] = 'gpu'
             params['gpu_platform_id'] = 0
             params['gpu_device_id'] = 0
-        
+
         # Create datasets
         train_data = lgb.Dataset(X_train, label=y_train)
         valid_data = lgb.Dataset(X_test, label=y_test, reference=train_data)
@@ -706,6 +731,12 @@ class PedestrianCountPredictor:
             'sensor_locations': self.sensor_locations,
             'model_type': self.model_type
         }
+        model_data.update({'lat_bins': getattr(self,'lat_bins', None),
+                   'lon_bins': getattr(self,'lon_bins', None)})
+        
+        self.lat_bins = model_data.get('lat_bins')
+        self.lon_bins = model_data.get('lon_bins')
+
         joblib.dump(model_data, filepath)
         print(f"Model saved to {filepath}")
     
@@ -735,7 +766,7 @@ if __name__ == "__main__":
     predictor.train_model(df, test_size=0.2, cv_folds=5)
     
     # Save model
-    predictor.save_model('pedestrian_count_model.pkl')
+    predictor.save_model('pedestrian_count_model_GPU.pkl')
     
     # Example prediction for a new location
     '''
