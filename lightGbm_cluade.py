@@ -18,7 +18,7 @@ import gc
 import joblib
 from haversine import haversine, Unit
 warnings.filterwarnings('ignore')
-
+import math
 # Optional: For GPU support
 try:
     import cupy as cp
@@ -106,63 +106,72 @@ class PedestrianCountPredictor:
 
 
 
-    def load_and_preprocess_data(self, file_path, chunksize=50000):
+    def load_and_preprocess_data(self, file_path: str):
         """
-        Load and preprocess the data with memory optimization
-        
-        Parameters:
-        -----------
-        file_path : str, path to the CSV file
-        chunksize : int, number of rows to read at once
+        Load the joined dataset (parquet preferred) and build stable spatial bins.
         """
-        print("Loading data in chunks for memory efficiency...")
-        
-        # Define dtypes for memory optimization
-        dtypes = {
-            # hourly joined CSV may already be normalized; these are safe
-            'Location_ID': 'string',        # allow NA just in case
-            'location_id': 'string',
-            'Sensor_Name': 'category',
-            'sensor_name': 'category',
-            'Latitude': 'float32',
-            'Longitude': 'float32',
-            'latitude': 'float32',
-            'longitude': 'float32',
-            'Direction_1': 'float32',
-            'Direction_2': 'float32',
-            'dir1': 'float32',
-            'dir2': 'float32',
-            'Total_of_Directions': 'float32',
-            'count': 'float32',
-            'HourDay': 'Int16'  # 0..23 if present
-    }
-        # Read data in chunks
-        chunks = []
-        for chunk in pd.read_csv(file_path, chunksize=chunksize, dtype=dtypes, 
-                                 parse_dates=['timestamp_local', 'timestamp_utc', 'date']):
-            # Process each chunk
-            chunk = self._process_chunk(chunk)
-            chunks.append(chunk)
-            
-            # Clear memory
-            gc.collect()
-        
-        # Combine all chunks
-        df = pd.concat(chunks, ignore_index=True)
+        import os
+        print("Loading data...")
+
+        if file_path.lower().endswith(".parquet"):
+            df = pd.read_parquet(file_path)
+        else:
+            # Fallback to CSV; auto-parse common timestamp cols if present
+            parse_cols = [c for c in ["timestamp_local", "timestamp_utc", "date"] if c in pd.read_csv(file_path, nrows=1).columns]
+            df = pd.read_csv(file_path, parse_dates=parse_cols if parse_cols else None)
+
+        # Required columns
+        req = {"location_id", "timestamp_local", "count", "latitude", "longitude"}
+        missing = req - set(df.columns)
+        if missing:
+            raise ValueError(f"Input missing columns: {sorted(missing)}")
+
+        # Ensure Melbourne timezone (don’t strip tz)
+        df["timestamp_local"] = pd.to_datetime(df["timestamp_local"], errors="coerce")
+        if getattr(df["timestamp_local"].dt, "tz", None) is None:
+            df["timestamp_local"] = df["timestamp_local"].dt.tz_localize("Australia/Melbourne", nonexistent="NaT", ambiguous="NaT")
+        else:
+            df["timestamp_local"] = df["timestamp_local"].dt.tz_convert("Australia/Melbourne")
+        df["timestamp_local"] = pd.to_datetime(df["timestamp_local"], errors="coerce")
+        if getattr(df["timestamp_local"].dt, "tz", None) is None:
+            df["timestamp_local"] = df["timestamp_local"].dt.tz_localize(
+                "Australia/Melbourne", nonexistent="NaT", ambiguous="NaT"
+            )
+        else:
+            df["timestamp_local"] = df["timestamp_local"].dt.tz_convert("Australia/Melbourne")
+
+        # 👇 drop rows where timestamp_local is NaT (DST gaps / bad parses)
+        df = df.dropna(subset=["timestamp_local"]).copy()
+
+        # Time features (safe now)
+        df["hour"] = df["timestamp_local"].dt.hour
+        df["dow"]  = df["timestamp_local"].dt.dayofweek
+
+        # 👇 fill NA in the boolean before casting to integer
+        is_weekend_bool = df["dow"].ge(5).fillna(False)
+        df["is_weekend"] = is_weekend_bool.astype("uint8")
+
+        # If you build other booleans, also use the filled mask
+        df["is_business_hours"] = (df["hour"].between(9, 17) & ~is_weekend_bool).astype("uint8")
+        df["is_peak_hour"] = (df["hour"].isin([7,8,9,17,18,19]) & ~is_weekend_bool).astype("uint8")
+
+        # Basic time features (downstream code also adds more)
+        t = df["timestamp_local"]
+        df["hour"]       = t.dt.hour.astype("Int8")
+        df["dow"]        = t.dt.dayofweek.astype("Int8")
+        df["is_weekend"] = (df["dow"] >= 5).astype("uint8")
+
+        # Coerce numerics
+        for c in ["latitude", "longitude", "count"]:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+        df = df.dropna(subset=["latitude", "longitude", "count"])
+
+        # Build **once** the global spatial bins and save edges
         df = self._compute_global_spatial_bins(df, bins=10)
 
-        del chunks
-        gc.collect()
-        
-        print(f"Data loaded: {df.shape[0]:,} rows, {df.shape[1]} columns")
-        print(f"Memory usage: {df.memory_usage(deep=True).sum() / 1024**2:.2f} MB")
-        df['lat_zone'] = pd.qcut(df['latitude'].astype('float64'),
-                         q=min(10, df['latitude'].nunique()),
-                         labels=False, duplicates='drop').astype('Int8')
-        df['lon_zone'] = pd.qcut(df['longitude'].astype('float64'),
-                         q=min(10, df['longitude'].nunique()),
-                         labels=False, duplicates='drop').astype('Int8')
+        print(f"Data loaded: {len(df):,} rows from {df['location_id'].nunique()} sensors")
         return df
+
     
     def _process_chunk(self, chunk):
         """Normalize columns, build timestamp, then add features safely."""
@@ -283,7 +292,7 @@ class PedestrianCountPredictor:
         df['spatial_cluster'] = (df['lat_zone'].astype('Int16') * 10 + df['lon_zone'].astype('Int16')).astype('Int16')
         
         # Distance to city center (Melbourne CBD approximate center)
-        cbd_lat, cbd_lon = -37.8136, 144.
+        cbd_lat, cbd_lon = -37.8136, 144.9631
 
         df['dist_to_cbd'] = self._haversine_vec(df['latitude'].to_numpy(),
                                         df['longitude'].to_numpy(),
@@ -390,22 +399,21 @@ class PedestrianCountPredictor:
         
         # Select feature columns
         feature_cols = [
-            # Location features
-            'latitude', 'longitude', 'dist_to_cbd', 'spatial_cluster',
-            'lat_zone', 'lon_zone',
-            # Temporal features
-            'hour', 'dow', 'is_weekend', 'is_business_hours', 'is_peak_hour',
-            'hour_sin', 'hour_cos', 'dow_sin', 'dow_cos', 'month_sin', 'month_cos',
-            # Directional features
-            'dir1', 'dir2', 'total_dir', 'dir_ratio',
-            # Location statistics
-            'count_mean', 'count_std', 'count_median', 'count_min', 'count_max',
-            # Lag features
-            'count_lag_1h', 'count_lag_24h', 'count_lag_168h',
-            'count_roll_mean_24h', 'count_roll_std_24h',
-            'count_roll_mean_168h', 'count_roll_std_168h'
+            # Location / geo
+            "latitude", "longitude", "dist_to_cbd", "spatial_cluster",
+            "lat_zone", "lon_zone",
+            # Time
+            "hour", "dow", "is_weekend", "is_business_hours", "is_peak_hour",
+            "hour_sin", "hour_cos", "dow_sin", "dow_cos", "month_sin", "month_cos",
+            # Directional if present
+            "dir1", "dir2", "total_dir", "dir_ratio",
+            # Lags & rolling
+            "count_lag_1h", "count_lag_24h", "count_lag_168h",
+            "count_roll_mean_24h", "count_roll_std_24h",
+            "count_roll_mean_168h", "count_roll_std_168h",
         ]
-        
+            
+        '''
         # Add distance features
         dist_cols = [col for col in df.columns if col.startswith('dist_to_loc_')]
         feature_cols.extend(dist_cols)
@@ -415,63 +423,67 @@ class PedestrianCountPredictor:
             feature_cols.extend(['year', 'month', 'day', 'dayofyear', 'weekofyear'])
         
         # Filter to existing columns
+        '''
         self.feature_cols = [col for col in feature_cols if col in df.columns]
         
         print(f"Total features: {len(self.feature_cols)}")
         
         return df
     
-    def train_model(self, df, test_size=0.2, cv_folds=5):
-        """
-        Train the prediction model
-        
-        Parameters:
-        -----------
-        df : pandas DataFrame
-        test_size : float, proportion of data for testing
-        cv_folds : int, number of cross-validation folds
-        """
+    def train_model(self, df, valid_days=28):
         print(f"Training {self.model_type} model...")
-        
-        # Prepare features
-        df = self.prepare_features(df)
-        
-        # Remove rows with NaN in critical columns
-        df = df.dropna(subset=self.feature_cols + ['count'])
-        
-        # Prepare X and y
-        X = df[self.feature_cols].values
-        y = df['count'].values
-        
-        # Scale features
-        X = self.scaler.fit_transform(X)
 
-        df = df.sort_values('timestamp_local')
-        cut = df['timestamp_local'].max() - pd.Timedelta(days=28)
-        train = df[df['timestamp_local'] <= cut]
-        test  = df[df['timestamp_local']  > cut]
-        X_train, y_train = train[self.feature_cols].values, train['count'].values
-        X_test,  y_test  = test[self.feature_cols].values,  test['count'].values
-        # Split data
-        '''
-        X_train, X_test, y_train, y_test = train_test_split(
-            X, y, test_size=test_size, random_state=42, shuffle=True
-        )
-        '''
-        
-        # Train model based on type
-        if self.model_type == 'lightgbm':
-            self._train_lightgbm(X_train, y_train, X_test, y_test, cv_folds)
+        df = self.prepare_features(df)
+        df = df.dropna(subset=self.feature_cols + ["count"]).sort_values("timestamp_local")
+
+        # Time-based split
+        cut = df["timestamp_local"].max() - pd.Timedelta(days=valid_days)
+        train = df[df["timestamp_local"] <= cut]
+        test  = df[df["timestamp_local"]  > cut]
+
+        X_train, y_train = train[self.feature_cols].values, train["count"].values
+        X_test,  y_test  = test[self.feature_cols].values,  test["count"].values
+
+        if self.model_type == "lightgbm":
+            params = {
+                "objective": "tweedie",
+                "tweedie_variance_power": 1.2,
+                "metric": ["rmse", "mae"],
+                "learning_rate": 0.05,
+                "num_leaves": 64,
+                "feature_fraction": 0.9,
+                "bagging_fraction": 0.9,
+                "bagging_freq": 1,
+                "verbose": -1,
+            }
+            train_data = lgb.Dataset(X_train, label=y_train)
+            valid_data = lgb.Dataset(X_test,  label=y_test, reference=train_data)
+            self.model = lgb.train(
+                params,
+                train_data,
+                valid_sets=[valid_data],
+                num_boost_round=3000,
+                callbacks=[lgb.early_stopping(200), lgb.log_evaluation(200)]
+            )
         else:
-            self._train_xgboost(X_train, y_train, X_test, y_test, cv_folds)
-        
-        # Evaluate on test set
-        self.evaluate(X_test, y_test)
-        
-        # Clear memory
-        gc.collect()
-        
+            # XGBoost version if you really want it (kept simple)
+            import xgboost as xgb
+            dtrain, dvalid = xgb.DMatrix(X_train, label=y_train), xgb.DMatrix(X_test, label=y_test)
+            self.model = xgb.train(
+                {"objective": "reg:tweedie", "tweedie_variance_power": 1.2, "eta": 0.05, "max_depth": 8},
+                dtrain, num_boost_round=3000, evals=[(dvalid, "valid")], early_stopping_rounds=200, verbose_eval=200
+            )
+
+        # Evaluate
+        pred = (self.model.predict(X_test, num_iteration=self.model.best_iteration)
+                if self.model_type == "lightgbm" else
+                self.model.predict(xgb.DMatrix(X_test)))
+        mae  = mean_absolute_error(y_test, pred)
+        rmse = math.sqrt(mean_squared_error(y_test, pred))
+        wape = (np.abs(y_test - pred).sum() / (y_test.sum() + 1e-9))
+        print(f"\nHoldout  MAE={mae:.2f}  RMSE={rmse:.2f}  WAPE={wape:.2%}")
         return self
+
     
     def _train_lightgbm(self, X_train, y_train, X_test, y_test, cv_folds):
         """Train LightGBM model"""
@@ -618,138 +630,191 @@ class PedestrianCountPredictor:
         idx = int(np.digitize([float(value)], bins, right=False)[0] - 1)
         return int(np.clip(idx, 0, len(bins) - 2))
 
-    def predict_location(self, latitude, longitude, timestamp, 
-                        dow=None, is_weekend=None, hour=None):
-        """
-        Predict pedestrian count for a new location
-        
-        Parameters:
-        -----------
-        latitude : float
-        longitude : float
-        timestamp : str or datetime
-        dow : int, day of week (0-6), optional
-        is_weekend : bool, optional
-        hour : int, hour of day (0-23), optional
-        
-        Returns:
-        --------
-        dict : prediction results
-        """
-        # Parse timestamp if string
-        if isinstance(timestamp, str):
-            timestamp = pd.to_datetime(timestamp)
-        
-        # Extract temporal features if not provided
-        if dow is None:
-            dow = timestamp.dayofweek
-        if is_weekend is None:
-            is_weekend = dow >= 5
-        if hour is None:
-            hour = timestamp.hour
-        
-        # Find nearest sensor for location statistics
+    def predict_location(self, latitude, longitude, timestamp, dow=None, is_weekend=None, hour=None):
+        # Parse timestamp and force Melbourne tz
+        ts = pd.to_datetime(timestamp)
+        ts = ts.tz_localize("Australia/Melbourne") if ts.tzinfo is None else ts.tz_convert("Australia/Melbourne")
+
+        # Temporal
+        if dow is None: dow = ts.dayofweek
+        if is_weekend is None: is_weekend = (dow >= 5)
+        if hour is None: hour = ts.hour
+
+        # Nearest sensor (for info)
         distances = self.sensor_locations.apply(
-            lambda row: haversine((latitude, longitude), 
-                                (row['latitude'], row['longitude']), 
-                                unit=Unit.KILOMETERS),
+            lambda row: haversine((latitude, longitude), (row["latitude"], row["longitude"]), unit=Unit.KILOMETERS),
             axis=1
         )
-        nearest_sensor_idx = distances.idxmin()
-        nearest_sensor = self.sensor_locations.iloc[nearest_sensor_idx]
-        
-        lat_zone = self._zone_from_bins(latitude, getattr(self, 'lat_bins', None))
-        lon_zone = self._zone_from_bins(longitude, getattr(self, 'lon_bins', None))
-        # Create feature vector
-        features = {
-            'latitude': latitude,
-            'longitude': longitude,
-            'hour': hour,
-            'dow': dow,
-            'is_weekend': is_weekend,
-            'dist_to_cbd': haversine((latitude, longitude), 
-                                    (-37.8136, 144.9631), 
-                                    unit=Unit.KILOMETERS),
-            'hour_sin': np.sin(2 * np.pi * hour / 24),
-            'hour_cos': np.cos(2 * np.pi * hour / 24),
-            'dow_sin': np.sin(2 * np.pi * dow / 7),
-            'dow_cos': np.cos(2 * np.pi * dow / 7),
-            'month_sin': np.sin(2 * np.pi * timestamp.month / 12),
-            'month_cos': np.cos(2 * np.pi * timestamp.month / 12),
-            'is_business_hours': (hour >= 9) and (hour <= 17) and (not is_weekend),
-            'is_peak_hour': (hour in [7, 8, 9, 17, 18, 19]) and (not is_weekend),
-            'lat_zone': lat_zone,
-            'lon_zone': lon_zone,
-            'spatial_cluster': lat_zone * 10 + lon_zone,
-            'year': timestamp.year,
-            'month': timestamp.month,
-            'day': timestamp.day,
-            'dayofyear': timestamp.dayofyear,
-            'weekofyear': timestamp.isocalendar()[1]
+        nearest_sensor = self.sensor_locations.iloc[distances.idxmin()]
+
+        # Zones via saved bins
+        lat_zone = self._zone_from_bins(latitude, getattr(self, "lat_bins", None))
+        lon_zone = self._zone_from_bins(longitude, getattr(self, "lon_bins", None))
+
+        # Feature vector (lags/rolling unknown → NaN, not zero)
+        feat = {
+            "latitude": latitude,
+            "longitude": longitude,
+            "hour": hour,
+            "dow": dow,
+            "is_weekend": int(is_weekend),
+            "dist_to_cbd": haversine((latitude, longitude), (-37.8136, 144.9631), unit=Unit.KILOMETERS),
+            "hour_sin": np.sin(2*np.pi*hour/24),
+            "hour_cos": np.cos(2*np.pi*hour/24),
+            "dow_sin":  np.sin(2*np.pi*dow/7),
+            "dow_cos":  np.cos(2*np.pi*dow/7),
+            "month_sin": np.sin(2*np.pi*ts.month/12),
+            "month_cos": np.cos(2*np.pi*ts.month/12),
+            "is_business_hours": int((hour >= 9) and (hour <= 17) and (not is_weekend)),
+            "is_peak_hour": int((hour in [7,8,9,17,18,19]) and (not is_weekend)),
+            "lat_zone": lat_zone,
+            "lon_zone": lon_zone,
+            "spatial_cluster": lat_zone * 10 + lon_zone,
+            "dir1": 0.0, "dir2": 0.0, "total_dir": 0.0, "dir_ratio": 0.5,
+            "count_lag_1h": np.nan, "count_lag_24h": np.nan, "count_lag_168h": np.nan,
+            "count_roll_mean_24h": np.nan, "count_roll_std_24h": np.nan,
+            "count_roll_mean_168h": np.nan, "count_roll_std_168h": np.nan,
         }
-        
-        # Add default values for missing features
-        for col in self.feature_cols:
-            if col not in features:
-                features[col] = 0
-        
-        # Create feature array
-        X_pred = np.array([[features[col] for col in self.feature_cols]])
-        X_pred = self.scaler.transform(X_pred)
-        
-        # Make prediction
-        if self.model_type == 'lightgbm':
-            prediction = self.model.predict(X_pred, num_iteration=self.model.best_iteration)[0]
+        # Align to trained columns
+        X = np.array([[feat.get(c, np.nan) for c in self.feature_cols]], dtype=float)
+
+        # Predict (LightGBM handles NaNs)
+        if self.model_type == "lightgbm":
+            yhat = float(self.model.predict(X, num_iteration=getattr(self.model, "best_iteration", None))[0])
         else:
-            dpred = xgb.DMatrix(X_pred)
-            prediction = self.model.predict(dpred)[0]
-        
-        # Ensure non-negative prediction
-        prediction = max(0, prediction)
-        
-        result = {
-            'predicted_count': int(round(prediction)),
-            'latitude': latitude,
-            'longitude': longitude,
-            'timestamp': timestamp.strftime('%Y-%m-%d %H:%M:%S'),
-            'nearest_sensor': nearest_sensor['sensor_name'],
-            'distance_to_nearest_sensor_km': round(distances.iloc[nearest_sensor_idx], 2),
-            'confidence_interval': {
-                'lower': int(max(0, prediction * 0.8)),
-                'upper': int(prediction * 1.2)
-            }
+            import xgboost as xgb
+            yhat = float(self.model.predict(xgb.DMatrix(X))[0])
+
+        yhat = max(0.0, yhat)  # non-negative
+        return {
+            "predicted_count": int(round(yhat)),
+            "latitude": latitude,
+            "longitude": longitude,
+            "timestamp": ts.strftime("%Y-%m-%d %H:%M:%S%z"),
+            "nearest_sensor": nearest_sensor.get("sensor_name", ""),
+            "distance_to_nearest_sensor_km": round(float(distances.min()), 2),
+            "confidence_interval": {"lower": int(max(0, yhat * 0.8)), "upper": int(yhat * 1.2)},
         }
-        
-        return result
+
     
     def save_model(self, filepath):
-        """Save the trained model and preprocessors"""
         model_data = {
-            'model': self.model,
-            'scaler': self.scaler,
-            'feature_cols': self.feature_cols,
-            'sensor_locations': self.sensor_locations,
-            'model_type': self.model_type
+            "model": self.model,
+            "feature_cols": self.feature_cols,
+            "sensor_locations": self.sensor_locations,
+            "model_type": self.model_type,
+            "lat_bins": getattr(self, "lat_bins", None),
+            "lon_bins": getattr(self, "lon_bins", None),
         }
-        model_data.update({'lat_bins': getattr(self,'lat_bins', None),
-                   'lon_bins': getattr(self,'lon_bins', None)})
-        
-        self.lat_bins = model_data.get('lat_bins')
-        self.lon_bins = model_data.get('lon_bins')
-
         joblib.dump(model_data, filepath)
         print(f"Model saved to {filepath}")
-    
+
     def load_model(self, filepath):
-        """Load a trained model and preprocessors"""
         model_data = joblib.load(filepath)
-        self.model = model_data['model']
-        self.scaler = model_data['scaler']
-        self.feature_cols = model_data['feature_cols']
-        self.sensor_locations = model_data['sensor_locations']
-        self.model_type = model_data['model_type']
+        self.model            = model_data["model"]
+        self.feature_cols     = model_data["feature_cols"]
+        self.sensor_locations = model_data["sensor_locations"]
+        self.model_type       = model_data["model_type"]
+        self.lat_bins         = model_data.get("lat_bins")
+        self.lon_bins         = model_data.get("lon_bins")
         print(f"Model loaded from {filepath}")
         return self
+# ---- drop this into your file (e.g., under PedestrianCountPredictor class) ----
+
+
+    def forecast_next_hours_known_sensors(predictor, history_df, H=6):
+        """
+        predictor : PedestrianCountPredictor already loaded with .load_model(...)
+        history_df: DataFrame with ['location_id','timestamp_local','count','latitude','longitude']
+                    timestamp_local must be tz-aware in Australia/Melbourne
+        H         : number of future hours to predict (recursive)
+
+        Returns DataFrame: [location_id, timestamp_local, pred, horizon_h]
+        """
+        # basic checks
+        need = {"location_id","timestamp_local","count","latitude","longitude"}
+        missing = need - set(history_df.columns)
+        if missing:
+            raise ValueError(f"history_df missing columns: {sorted(missing)}")
+
+        wk = history_df.copy()
+        # ensure Melbourne tz
+        ts = pd.to_datetime(wk["timestamp_local"], errors="coerce")
+        if getattr(ts.dt, "tz", None) is None:
+            ts = ts.dt.tz_localize("Australia/Melbourne", nonexistent="NaT", ambiguous="NaT")
+        else:
+            ts = ts.dt.tz_convert("Australia/Melbourne")
+        wk["timestamp_local"] = ts
+        wk = wk.dropna(subset=["timestamp_local"]).sort_values(["location_id","timestamp_local"])
+
+        out = []
+        for step in range(1, H+1):
+            t_next = wk["timestamp_local"].max() + pd.Timedelta(hours=1)
+
+            base = (wk.groupby("location_id", as_index=False)
+                    .tail(1)[["location_id","latitude","longitude"]])
+            base["timestamp_local"] = t_next
+
+            # time features (same as training)
+            base["hour"] = base["timestamp_local"].dt.hour
+            base["dow"]  = base["timestamp_local"].dt.dayofweek
+            is_weekend = base["dow"] >= 5
+            base["is_weekend"]       = is_weekend.astype("uint8")
+            base["is_business_hours"]= (base["hour"].between(9,17) & ~is_weekend).astype("uint8")
+            base["is_peak_hour"]     = (base["hour"].isin([7,8,9,17,18,19]) & ~is_weekend).astype("uint8")
+            base["hour_sin"] = np.sin(2*np.pi*base["hour"]/24)
+            base["hour_cos"] = np.cos(2*np.pi*base["hour"]/24)
+            base["dow_sin"]  = np.sin(2*np.pi*base["dow"]/7)
+            base["dow_cos"]  = np.cos(2*np.pi*base["dow"]/7)
+            base["month_sin"]= np.sin(2*np.pi*base["timestamp_local"].dt.month/12)
+            base["month_cos"]= np.cos(2*np.pi*base["timestamp_local"].dt.month/12)
+
+            # spatial features
+            def _zone(val, bins):
+                if bins is None or len(bins) < 2 or pd.isna(val): return 0
+                idx = int(np.digitize([float(val)], bins, right=False)[0] - 1)
+                return int(np.clip(idx, 0, len(bins)-2))
+            base["lat_zone"] = [ _zone(v, predictor.lat_bins) for v in base["latitude"] ]
+            base["lon_zone"] = [ _zone(v, predictor.lon_bins) for v in base["longitude"] ]
+            base["spatial_cluster"] = base["lat_zone"]*10 + base["lon_zone"]
+
+            # distance to CBD (same as training)
+            def hav(lat1, lon1, lat2=-37.8136, lon2=144.9631):
+                R=6371.0088
+                lat1,lon1,lat2,lon2 = map(np.radians, [lat1,lon1,lat2,lon2])
+                return 2*R*np.arcsin(np.sqrt(np.sin((lat2-lat1)/2)**2 + np.cos(lat1)*np.cos(lat2)*np.sin((lon2-lon1)/2)**2))
+            base["dist_to_cbd"] = hav(base["latitude"].astype(float), base["longitude"].astype(float))
+
+            # directional placeholders (your model may or may not use them)
+            for c in ["dir1","dir2","total_dir","dir_ratio"]:
+                base[c] = 0.0
+
+            # lags/rollings from history
+            g = wk.groupby("location_id")["count"]
+            for L in (1,24,168):
+                lastL = g.apply(lambda s, L=L: s.iloc[-L] if len(s) >= L else np.nan)
+                base[f"count_lag_{L}h"] = base["location_id"].map(lastL.to_dict()).astype("float32")
+            for w in (24,168):
+                m = g.apply(lambda s, w=w: s.iloc[-w:].mean() if len(s) >= 1 else np.nan)
+                s = g.apply(lambda s, w=w: s.iloc[-w:].std()  if len(s) >= 2 else 0.0)
+                base[f"count_roll_mean_{w}h"] = base["location_id"].map(m.to_dict()).astype("float32")
+                base[f"count_roll_std_{w}h"]  = base["location_id"].map(s.to_dict()).astype("float32")
+
+            # line up features and predict
+            X = base[[c for c in predictor.feature_cols]].to_numpy(dtype=float)
+            yhat = predictor.model.predict(X, num_iteration=getattr(predictor.model, "best_iteration", None))
+            step_out = base[["location_id"]].copy()
+            step_out["timestamp_local"] = t_next
+            step_out["pred"] = yhat
+            step_out["horizon_h"] = step
+            out.append(step_out)
+
+            # recursive: append as next observed hour
+            add = step_out.rename(columns={"pred":"count"})[["location_id","timestamp_local","count"]]
+            add = add.merge(wk.drop_duplicates("location_id")[["location_id","latitude","longitude"]], on="location_id", how="left")
+            wk = pd.concat([wk, add], ignore_index=True).sort_values(["location_id","timestamp_local"])
+
+        return pd.concat(out, ignore_index=True).sort_values(["horizon_h","location_id"])
 
 
 # Example usage
@@ -763,10 +828,10 @@ if __name__ == "__main__":
     df = predictor.load_and_preprocess_data('data/processed/melbourne_pedestrian_hourly_joined.csv')
 
     # Train model
-    predictor.train_model(df, test_size=0.2, cv_folds=5)
+    predictor.train_model(df)  
     
     # Save model
-    predictor.save_model('pedestrian_count_model_GPU.pkl')
+    predictor.save_model('pedestrian_count_model_GPU_2.pkl')
     
     # Example prediction for a new location
     '''
@@ -783,16 +848,3 @@ if __name__ == "__main__":
     print("Batch Predictions for Multiple Locations:")
     print("="*50)
     
-    locations = [
-        (-37.8136, 144.9631),  # Melbourne CBD
-        (-37.8183, 144.9671),  # Flinders Street Station area
-        (-37.8102, 144.9628),  # Queen Victoria Market area
-    ]
-    
-    for lat, lon in locations:
-        pred = predictor.predict_location(
-            latitude=lat,
-            longitude=lon,
-            timestamp='2024-03-15 17:30:00'  # Friday evening peak hour
-        )
-        print(f"({lat:.4f}, {lon:.4f}): {pred['predicted_count']} pedestrians")
